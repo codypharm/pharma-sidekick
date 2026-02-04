@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 import uuid
 import asyncio
 from langchain_core.messages import ToolMessage
-from pharmacy_tools import check_drug_allergy, check_drug_interaction,  calculate_daily_dose,check_duplicate_therapy,check_geriatric_considerations,check_pediatric_dosing,check_renal_dosing,check_pregnancy_safety,check_drug_recall
+from pharmacy_tools import check_drug_allergy, check_drug_interaction,  calculate_daily_dose,check_duplicate_therapy,check_geriatric_considerations,check_pediatric_dosing,check_renal_dosing,check_pregnancy_safety,check_drug_recall,check_multi_drug_interactions,check_therapeutic_duplication,get_controlled_substance_info
 load_dotenv(override=True)
 
 
@@ -32,13 +32,7 @@ class EvaluatorOutput(BaseModel):
         description="True if more input is needed from the pharmacist, or clarifications, or the assistant is stuck"
     )
 
-class FinalClinicalAssessment(BaseModel):
-    decision: str = Field(description="Dispense or Do Not Dispense")
-    reasoning: str = Field(description="Clinical reasoning for the decision")
-    recommendations: List[str] = Field(description="Recommendations for the pharmacist")
-    user_input_needed: bool = Field(
-        description="True if more input is needed from the pharmacist, or clarifications, or the assistant is stuck"
-    )
+
 
 DEFAULT_SUCCESS_CRITERIA = """
 1. All relevant clinical checks completed (allergies, interactions, dosing)
@@ -47,7 +41,7 @@ DEFAULT_SUCCESS_CRITERIA = """
 4. Specific recommendations given to pharmacist
 """
 
-def final_clinical_assessment(decision: str, reasoning: str, recommendations: List[str], user_input_needed: bool) -> str:
+def final_clinical_assessment(decision: str, reasoning: str, recommendations: List[str], user_input_needed: bool = False) -> str:
     """
     Submit the final clinical assessment.
     
@@ -55,9 +49,9 @@ def final_clinical_assessment(decision: str, reasoning: str, recommendations: Li
         decision: "Dispense" or "Do Not Dispense"
         reasoning: Clinical reasoning for the decision
         recommendations: Recommendations for the pharmacist
-        user_input_needed: True if more input is needed
+        user_input_needed: True if more input is needed (default: False)
     """
-    return f"Assessment Recorded: {decision}"
+    return f"Assessment Recorded:\nDecision: {decision}\nReasoning: {reasoning}\nRecommendations: {', '.join(recommendations)}\nUser Input Needed: {user_input_needed}"
 
 
 class Sidekick:
@@ -88,8 +82,21 @@ You have access to specialized pharmacy verification tools. You MUST use these t
 If you notice absence of needed information, ask a clarifying question.
 For example, if you need the patient's weight in kg for pediatric dosing, ask a question like: "Question: The patient's weight in kg is missing but required for pediatric dosing. Please provide the weight."
 if you need name of medicine : "Question: The name of the medicine is missing but required for pediatric dosing. Please provide the name."
+Always check patient age before calling tools like check_geriatric_considerations or check_pediatric_dosing.
 Success Criteria:
 {state['success_criteria']}
+
+Tool call rules:
+1. Only call check_pregnancy_safety if patient is pregnant
+2. Only call check_geriatric_considerations if patient is 65 years or older
+3. Only call check_pediatric_dosing if patient is a child based on age
+4. Only call check_renal_dosing if patient has renal impairment
+5. Only call check_duplicate_therapy if patient is taking multiple medications
+6. Only call check_drug_interaction if patient is taking multiple medications
+7. Only call check_multi_drug_interactions if patient is taking multiple medications
+8. Only call check_therapeutic_duplication if patient is taking multiple medications
+
+
     
 WORKFLOW:
 1. Use available tools to gather all necessary clinical information
@@ -104,7 +111,7 @@ Response Guidelines:
   * decision: "Dispense" or "Do Not Dispense"
   * reasoning: Complete clinical reasoning
   * recommendations: List of specific recommendations
-  * user_input_needed: Set to False when complete
+  * user_input_needed: Set to False when complete or True if more information is needed
 """
             
         # Add in the system message
@@ -158,13 +165,15 @@ Response Guidelines:
                     conversation.append(f"Assistant: [Used tools: {', '.join(tools_used)}]")
                 if message.content:
                     conversation.append(f"Assistant: {message.content}")
+            elif isinstance(message, ToolMessage):
+                conversation.append(f"Tool Output: {message.content}")
         
         return "\n\n".join(conversation)
 
     def evaluator(self, state: State) -> State:
         last_response = state["messages"][-1].content
 
-        system_message = """You are a Clinical Supervisor evaluating a Pharmacy Assistant agent's prescription validation work.
+        system_message = f"""You are a Clinical Supervisor evaluating a Pharmacy Assistant agent's prescription validation work.
 
             Your role: Determine if the task has been completed thoroughly, safely, and with proper clinical reasoning.
 
@@ -184,7 +193,7 @@ Response Guidelines:
             - DO penalize for missing relevant checks (e.g., not checking allergies at all)
 
             3. **Clear Outcome**
-            - Did the assistant provide a definitive recommendation using FinalClinicalAssessment?
+            - Did the assistant provide a definitive recommendation using final_clinical_assessment tool?
             - OR did they ask a legitimate clarifying question?
 
             4. **User Input Assessment**

@@ -6,125 +6,159 @@ Clean, focused functions - LangGraph will handle tool definitions automatically
 import requests
 from typing import Dict, List, Optional
 import re
+from functools import lru_cache
 
+
+@lru_cache(maxsize=500)
+def normalize_drug_name(drug_name: str) -> Dict:
+    """
+    Normalize drug name using RxNorm API.
+    Returns RxCUI, preferred name, ingredients, brand names, ATC classes, etc.
+    """
+    base_url = "https://rxnav.nlm.nih.gov/REST"
+    
+    try:
+        # Step 1: Find RxCUI
+        url = f"{base_url}/drugs?name={requests.utils.quote(drug_name)}"
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        
+        concept_group = data.get("drugGroup", {}).get("conceptGroup", [])
+        if not concept_group:
+            return {"success": False, "error": "No match found in RxNorm", "raw_name": drug_name}
+        
+        # Prefer SCD/SBD/BN/IN
+        best = next(
+            (c for c in concept_group if c.get("tty") in ["SCD", "SBD", "BN", "IN", "PIN"]),
+            concept_group[0]
+        )
+        rxcui = best.get("rxcui")
+        if not rxcui:
+            return {"success": False, "error": "No RxCUI found", "raw_name": drug_name}
+        
+        # Step 2: Get properties
+        detail_url = f"{base_url}/rxcui/{rxcui}/properties.json"
+        detail_resp = requests.get(detail_url, timeout=6)
+        props = detail_resp.json().get("propConceptGroup", {}).get("propConcept", [])
+        
+        result = {
+            "success": True,
+            "rxcui": rxcui,
+            "input_name": drug_name,
+            "preferred_name": next((p["propValue"] for p in props if p["propName"] == "RxNorm Preferred Name"), drug_name),
+            "generic_name": next((p["propValue"] for p in props if p["propName"] == "RxNorm Generic Name"), None),
+            "ingredients": [],
+            "brand_names": [],
+            "atc_classes": [],
+        }
+        
+        # Step 3: Related concepts (ingredients, brands)
+        rel_url = f"{base_url}/rxcui/{rxcui}/related.json?tty=IN+MIN+PIN+BN"
+        rel_resp = requests.get(rel_url, timeout=6)
+        rel_data = rel_resp.json().get("relatedGroup", {}).get("conceptGroup", [])
+        
+        for group in rel_data:
+            tty = group.get("tty")
+            concepts = group.get("conceptProperties", [])
+            if tty == "IN":
+                result["ingredients"] = [c["name"] for c in concepts]
+            elif tty == "BN":
+                result["brand_names"] = [c["name"] for c in concepts]
+        
+        # Step 4: ATC classification (via RxClass)
+        atc_url = f"https://rxnav.nlm.nih.gov/REST/rxclass/class/byRxcui.json?rxcui={rxcui}&classTypes=ATC"
+        atc_resp = requests.get(atc_url, timeout=6)
+        atc_data = atc_resp.json().get("rxclassDrugInfoList", {}).get("rxclassDrugInfo", [])
+        result["atc_classes"] = [item["classId"] for item in atc_data] if atc_data else []
+        
+        return result
+    
+    except Exception as e:
+        return {"success": False, "error": str(e), "raw_name": drug_name}
 
 # ============================================================================
 # CRITICAL SAFETY CHECKS
 # ============================================================================
 
-def check_drug_allergy(drug_name: str, patient_allergies: List[str]) -> Dict:
+def check_drug_allergy(
+    drug_name: str,
+    patient_allergies: List[str],
+    normalized: Optional[Dict] = None
+) -> Dict:
     """
-    Check if patient is allergic to the medication.
-    CRITICAL - Use this FIRST before any other validation.
-    
-    Returns dict with has_allergy, allergy_type, allergen, recommendation
+    Check for direct allergy or cross-reactivity.
+    Enhanced with RxNorm ingredients when available.
     """
-    label = get_drug_label_info(drug_name)
-    
-    drug_lower = drug_name.lower()
-    generic_lower = (label.get('generic_name') or '').lower()
-    
-    for allergy in patient_allergies:
-        allergy_lower = allergy.lower()
-        
-        # Direct match
-        if allergy_lower == drug_lower or allergy_lower == generic_lower:
+    norm = normalized or normalize_drug_name(drug_name)
+    generic_lower = ""
+    ingredients_lower = []
+
+    if norm.get("success"):
+        generic_lower = (norm.get("generic_name") or "").lower()
+        ingredients_lower = [ing.lower() for ing in norm.get("ingredients", [])]
+    else:
+        label = get_drug_label_info(drug_name)
+        generic_lower = (label.get('generic_name') or '').lower()
+
+    for allergy in [a.lower() for a in patient_allergies]:
+        if allergy in generic_lower or any(allergy in ing for ing in ingredients_lower):
             return {
                 'has_allergy': True,
-                'allergy_type': 'direct',
                 'allergen': allergy,
-                'drug_checked': drug_name,
-                'recommendation': "🚨 CRITICAL: DO NOT DISPENSE. Patient has documented allergy. Contact prescriber immediately."
+                'recommendation': "CRITICAL: Documented allergy. DO NOT DISPENSE. Contact prescriber."
             }
-        
-        # Cross-reactivity check
+
+        # Basic cross-reactivity examples (expand as needed)
         cross_reactions = {
-            'penicillin': ['amoxicillin', 'ampicillin', 'penicillin'],
-            'sulfa': ['sulfamethoxazole', 'trimethoprim', 'sulfasalazine'],
-            'cephalosporin': ['cephalexin', 'cefazolin', 'ceftriaxone']
+            'penicillin': ['amoxicillin', 'ampicillin', 'piperacillin'],
+            'sulfa': ['sulfamethoxazole', 'sulfasalazine'],
+            'statin': ['atorvastatin', 'simvastatin', 'rosuvastatin']
         }
-        
-        for allergen_class, related_drugs in cross_reactions.items():
-            if allergen_class in allergy_lower:
-                if any(related in generic_lower or related in drug_lower for related in related_drugs):
+        for allergen_class, related in cross_reactions.items():
+            if allergen_class in allergy:
+                if any(r in generic_lower or r in ingredients_lower for r in related):
                     return {
                         'has_allergy': True,
                         'allergy_type': 'cross-reactivity',
-                        'allergen': allergy,
-                        'drug_checked': drug_name,
-                        'recommendation': f"⚠️ MAJOR: Possible cross-reactivity with {allergy} allergy. Verify with prescriber."
+                        'recommendation': f"Possible cross-reactivity with {allergy}. Verify with prescriber."
                     }
-    
+
     return {
         'has_allergy': False,
-        'allergy_type': None,
-        'allergen': None,
-        'drug_checked': drug_name,
-        'recommendation': "No allergy detected. Safe to proceed."
+        'recommendation': "No allergy or cross-reactivity detected."
     }
 
 
+
 def check_drug_recall(drug_name: str, lot_number: Optional[str] = None) -> Dict:
-    """
-    Check if drug or specific lot has been recalled by FDA.
-    
-    Returns dict with has_recall, active_recalls, recommendation
-    """
+    """Check FDA recalls (your original function - kept mostly unchanged)"""
     base_url = "https://api.fda.gov/drug/enforcement.json"
-    
     search = f'product_description:"{drug_name}"'
     if lot_number:
         search += f'+AND+code_info:"{lot_number}"'
-    
+
     try:
         url = f"{base_url}?search={search}&limit=10"
         response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json()
-        
         results = data.get('results', [])
-        
-        if not results:
-            return {
-                'has_recall': False,
-                'active_recalls': [],
-                'recommendation': "No active recalls found."
-            }
-        
-        # Filter for active recalls
-        active = []
-        for recall in results:
-            if recall.get('status', '').lower() in ['ongoing', 'pending']:
-                active.append({
-                    'reason': recall.get('reason_for_recall'),
-                    'classification': recall.get('classification'),
-                    'date': recall.get('recall_initiation_date'),
-                    'lot_numbers': recall.get('code_info'),
-                    'status': recall.get('status')
-                })
-        
+
+        active = [r for r in results if r.get('status', '').lower() in ['ongoing', 'pending']]
+
         if active:
             return {
                 'has_recall': True,
                 'active_recalls': active,
-                'recall_count': len(active),
-                'recommendation': "🚨 CRITICAL: Active recall found. DO NOT DISPENSE. Quarantine product and notify supervisor."
+                'recommendation': "ACTIVE RECALL DETECTED. DO NOT DISPENSE."
             }
-        
         return {
             'has_recall': False,
-            'active_recalls': [],
-            'past_recalls': len(results),
-            'recommendation': f"No active recalls. {len(results)} resolved recalls in history."
+            'recommendation': f"No active recalls. {len(results)} historical recalls found."
         }
-        
     except Exception as e:
-        return {
-            'has_recall': None,
-            'active_recalls': [],
-            'recommendation': f"Unable to check recalls: {str(e)}. Verify through alternative means."
-        }
-
+        return {'has_recall': None, 'recommendation': f"Recall check failed: {str(e)}"}
 
 # ============================================================================
 # PATIENT-SPECIFIC CHECKS
@@ -139,7 +173,12 @@ def check_pregnancy_safety(drug_name: str, trimester: Optional[int] = None) -> D
     """
 
     print("Pregnancy checker called")
-    label = get_drug_label_info(drug_name)
+    
+    # Normalize to generic for better label match
+    norm = normalize_drug_name(drug_name)
+    search_name = norm.get("generic_name") or drug_name
+    
+    label = get_drug_label_info(search_name)
     
     if not label or not label.get('pregnancy_info'):
         return {
@@ -192,6 +231,11 @@ def check_renal_dosing(drug_name: str, creatinine_clearance: float) -> Dict:
     Returns dict with requires_adjustment, severity, guidance, recommendation
     """
     label = get_drug_label_info(drug_name)
+    
+    # Normalize to generic for better label match
+    norm = normalize_drug_name(drug_name)
+    search_name = norm.get("generic_name") or drug_name
+    label = get_drug_label_info(search_name)
     
     print("Renal checker called")
     if not label:
@@ -247,7 +291,11 @@ def check_pediatric_dosing(drug_name: str, patient_age: int, weight_kg: Optional
     
     Returns dict with approved_for_age, dosing_info, weight_based, recommendation
     """
-    label = get_drug_label_info(drug_name)
+    # Normalize to generic for better label match
+    norm = normalize_drug_name(drug_name)
+    search_name = norm.get("generic_name") or drug_name
+    
+    label = get_drug_label_info(search_name)
     
     print("Pediatric checker called")
     if not label:
@@ -304,7 +352,11 @@ def check_geriatric_considerations(drug_name: str, patient_age: int) -> Dict:
     
     Returns dict with requires_adjustment, beers_criteria, considerations, recommendation
     """
-    label = get_drug_label_info(drug_name)
+    # Normalize to generic for better label match
+    norm = normalize_drug_name(drug_name)
+    search_name = norm.get("generic_name") or drug_name
+    
+    label = get_drug_label_info(search_name)
     
     print("Geriatric checker called")
     if not label:
@@ -375,8 +427,12 @@ def check_drug_interaction(drug1: str, drug2: str) -> Dict:
     interactions = label['drug_interactions'].lower()
     drug2_lower = drug2.lower()
     
-    # Check if drug2 mentioned in interactions
-    if drug2_lower in interactions:
+    # Normalize drug2 to get generic name (labels usually list generics)
+    drug2_norm = normalize_drug_name(drug2)
+    drug2_generic = (drug2_norm.get("generic_name") or drug2).lower()
+    
+    # Check if drug2 (brand or generic) mentioned in interactions
+    if drug2_lower in interactions or drug2_generic in interactions:
         # Determine severity
         severity = "moderate"
         if any(word in interactions for word in ['contraindicated', 'avoid', 'serious', 'severe']):
@@ -386,14 +442,14 @@ def check_drug_interaction(drug1: str, drug2: str) -> Dict:
         
         # Extract relevant portion
         sentences = interactions.split('.')
-        relevant = [s for s in sentences if drug2_lower in s]
+        relevant = [s for s in sentences if drug2_lower in s or drug2_generic in s]
         description = '. '.join(relevant[:2]) if relevant else interactions[:500]
         
         return {
             'has_interaction': True,
             'severity': severity,
             'description': description,
-            'recommendation': f"Review interaction between {drug1} and {drug2}. Consider alternative or enhanced monitoring."
+            'recommendation': f"Review interaction between {drug1} and {drug2} ({drug2_generic}). Consider alternative or enhanced monitoring."
         }
     
     return {
@@ -476,7 +532,7 @@ def check_duplicate_therapy(medications: List[Dict]) -> List[Dict]:
                     'drug1': generic_map[generic_name]['drug_name'],
                     'drug2': med.get('drug_name'),
                     'issue': f"Duplicate therapy: Both contain {generic_name}",
-                    'recommendation': "⚠️ MAJOR: Remove duplicate or verify both intended by prescriber."
+                    'recommendation': "MAJOR: Remove duplicate or verify both intended by prescriber."
                 })
             else:
                 generic_map[generic_name] = med
@@ -489,7 +545,7 @@ def check_duplicate_therapy(medications: List[Dict]) -> List[Dict]:
                     'drug1': med.get('drug_name'),
                     'drug2': medications[j].get('drug_name'),
                     'issue': "Exact duplicate medication",
-                    'recommendation': "🚨 CRITICAL: Remove duplicate entry."
+                    'recommendation': "CRITICAL: Remove duplicate entry."
                 })
     
     return duplicates
@@ -553,6 +609,126 @@ def calculate_daily_dose(dose_per_administration: str, frequency: str) -> Dict:
         'warning': warning
     }
 
+# ============================================================================
+# REGIMEN-LEVEL CHECKS 
+# ============================================================================
+
+def check_multi_drug_interactions(drugs: List[str]) -> Dict:
+    """
+    Basic multi-drug interaction scan (label-based pairwise).
+    Production recommendation: replace with DrugBank / FDB / Medi-Span API.
+    """
+    issues = []
+    seen_pairs = set()
+
+    for i, drug1 in enumerate(drugs):
+        label = get_drug_label_info(drug1)
+        interactions_text = (label.get('drug_interactions') or '').lower()
+
+        for j, drug2 in enumerate(drugs[i+1:], start=i+1):
+            pair = tuple(sorted([drug1.lower(), drug2.lower()]))
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+
+            drug2_norm = normalize_drug_name(drug2)
+            drug2_generic = (drug2_norm.get("generic_name") or drug2).lower()
+
+            if drug2.lower() in interactions_text or drug2_generic in interactions_text:
+                severity = "major" if any(w in interactions_text for w in ['contraindicated', 'avoid', 'serious']) else "moderate"
+                issues.append({
+                    'pair': (drug1, drug2),
+                    'severity': severity,
+                    'source': 'fda_label'
+                })
+
+    if issues:
+        return {
+            'has_interactions': True,
+            'issues': issues,
+            'recommendation': "Potential drug-drug interactions detected - urgent review required."
+        }
+    return {
+        'has_interactions': False,
+        'recommendation': "No interactions found in available labels."
+    }
+
+
+def check_therapeutic_duplication(medications: List[Dict]) -> List[Dict]:
+    """
+    Detect exact duplicates and therapeutic class duplication using ATC codes.
+    Expects medications = [{'drug_name': str, 'normalized': Dict (optional)}, ...]
+    """
+    duplicates = []
+    class_seen: Dict[str, List[str]] = {}  # atc_level_4/5 → drug list
+    generic_seen = set()
+
+    for med in medications:
+        drug_name = med.get('drug_name', '')
+        norm = med.get('normalized') or normalize_drug_name(drug_name)
+
+        if not norm.get("success"):
+            continue
+
+        generic = (norm.get("generic_name") or drug_name).lower()
+        atc_list = norm.get("atc_classes", [])
+
+        # Exact generic duplicate
+        if generic in generic_seen:
+            duplicates.append({
+                'type': 'exact_duplicate',
+                'generic': generic,
+                'drugs': [drug_name],
+                'recommendation': "Duplicate therapy - same active ingredient"
+            })
+        generic_seen.add(generic)
+
+        # Therapeutic class duplication (ATC level 4 or 5)
+        for atc in atc_list:
+            atc_key = atc[:5]  # typically level 4 or 5
+            if atc_key in class_seen:
+                duplicates.append({
+                    'type': 'therapeutic_duplication',
+                    'atc_class': atc_key,
+                    'drugs': class_seen[atc_key] + [drug_name],
+                    'recommendation': f"Therapeutic class duplication (ATC {atc_key})"
+                })
+            class_seen.setdefault(atc_key, []).append(drug_name)
+
+    return duplicates
+
+
+def get_controlled_substance_info(drug_name: str, rxcui: Optional[str] = None) -> Dict:
+    """Determine DEA schedule via openFDA NDC data"""
+    try:
+        if rxcui:
+            url = f"https://api.fda.gov/drug/ndc.json?search=openfda.rxcui:{rxcui}&limit=3"
+        else:
+            url = f"https://api.fda.gov/drug/ndc.json?search=openfda.brand_name:\"{drug_name}\"&limit=3"
+
+        resp = requests.get(url, timeout=8)
+        data = resp.json()
+        results = data.get('results', [])
+
+        if not results:
+            return {'is_controlled': False, 'schedule': 'Unknown', 'recommendation': "No NDC/schedule data found"}
+
+        sched = results[0].get('openfda', {}).get('dea_schedule', ['Not controlled'])[0]
+
+        if sched in ['2', '3', '4', '5']:
+            return {
+                'is_controlled': True,
+                'schedule': f"Schedule {sched}",
+                'recommendation': f"Controlled substance (DEA Sch {sched}) — PDMP query recommended"
+            }
+        return {
+            'is_controlled': False,
+            'schedule': sched,
+            'recommendation': "Non-controlled substance"
+        }
+
+    except Exception:
+        return {'is_controlled': None, 'recommendation': "Unable to determine controlled status"}
 
 # ============================================================================
 # DRUG INFORMATION
