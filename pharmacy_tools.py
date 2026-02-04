@@ -9,7 +9,7 @@ import re
 from functools import lru_cache
 
 
-@lru_cache(maxsize=500)
+@lru_cache(maxsize=None)
 def normalize_drug_name(drug_name: str) -> Dict:
     """
     Normalize drug name using RxNorm API.
@@ -554,7 +554,7 @@ def check_duplicate_therapy(medications: List[Dict]) -> List[Dict]:
 # ============================================================================
 # DOSING VALIDATION
 # ============================================================================
-
+@lru_cache(maxsize=None)
 def calculate_daily_dose(dose_per_administration: str, frequency: str) -> Dict:
     """
     Calculate total daily dose from single dose and frequency.
@@ -733,7 +733,7 @@ def get_controlled_substance_info(drug_name: str, rxcui: Optional[str] = None) -
 # ============================================================================
 # DRUG INFORMATION
 # ============================================================================
-
+@lru_cache(maxsize=None)
 def get_drug_label_info(drug_name: str) -> Dict:
     """
     Get comprehensive FDA drug label information.

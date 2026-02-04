@@ -86,16 +86,17 @@ Always check patient age before calling tools like check_geriatric_consideration
 Success Criteria:
 {state['success_criteria']}
 
-Tool call rules:
-1. Only call check_pregnancy_safety if patient is pregnant
-2. Only call check_geriatric_considerations if patient is 65 years or older
-3. Only call check_pediatric_dosing if patient is a child based on age
-4. Only call check_renal_dosing if patient has renal impairment
-5. Only call check_duplicate_therapy if patient is taking multiple medications
-6. Only call check_drug_interaction if patient is taking multiple medications
-7. Only call check_multi_drug_interactions if patient is taking multiple medications
-8. Only call check_therapeutic_duplication if patient is taking multiple medications
+Tool call rules — be extremely selective — only call a tool when you are 100% certain it is necessary right now:
 
+Tool call rules:
+• ALWAYS call check_drug_allergy FIRST if allergies are provided
+• ONLY call check_pediatric_dosing if age < 18 AND weight is known
+• ONLY call check_geriatric_considerations if age >= 65
+• ONLY call check_renal_dosing if CrCl or "renal impairment" is explicitly stated
+• ONLY call check_pregnancy_safety if "pregnant" or "pregnancy" appears in patient info
+• For interactions/duplicates: call check_multi_drug_interactions or check_therapeutic_duplication INSTEAD of single check_drug_interaction / check_duplicate_therapy
+• NEVER call more than 3 tools in one turn unless patient has >5 drugs
+• If unsure whether a tool is needed → ASK the pharmacist instead of calling it
 
     
 WORKFLOW:
